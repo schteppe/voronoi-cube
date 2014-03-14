@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+<head>
+    <style>canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%;}</style>
+    <script src="lib/require.js"></script>
+    <script src="lib/goo.js"></script>
+    <script src="volumes.js"></script>
+    <script src="lib/ammo.small.js"></script>
+    <title>Voronoi scattering</title>
+</head>
+<body>
+
+<div id="credits" style="position: absolute; z-index: 2000; top: 10px; left: 10px; -webkit-user-select: none;">
+    <a style="text-decoration: none;" href="http://twitter.com/schteppe" target="_blank">
+        <span style="color: #EEE; font-family: Helvetica, sans-serif; font-size: 11px; display: inline-block; margin-top: 0px; margin-right: -3px; vertical-align: top;">
+            @schteppe
+        </span>
+    </a>
+</div>
+
+<script>
+require([
+    'goo/entities/GooRunner',
+    'goo/renderer/Camera',
+    'goo/renderer/Material',
+    'goo/renderer/light/SpotLight',
+    'goo/renderer/shaders/ShaderLib',
+    'goo/scripts/OrbitCamControlScript',
+    'goo/shapes/ShapeCreator',
+    'goo/renderer/MeshData',
+    'goo/math/Quaternion',
+    'goo/math/Vector3',
+], function (
+    GooRunner,
+    Camera,
+    Material,
+    SpotLight,
+    ShaderLib,
+    OrbitCamControlScript,
+    ShapeCreator,
+    MeshData,
+    Quaternion,
+    Vector3
+) {
+    "use strict";
+
+    var goo = new GooRunner();
+    var world = goo.world;
+    document.body.appendChild(goo.renderer.domElement);
+    goo.renderer.setClearColor(0.1, 0.1, 0.1, 1.0); // dark blue-grey
+
+    var groundPos = [0,-3,0];
+    var density = 1;
+
+    var meshes = [];
+    var bodies = [];
+
+    // Add some physics
+    var collisionConfiguration = new Ammo.btDefaultCollisionConfiguration(); // every single |new| currently leaks...
+    var dispatcher = new Ammo.btCollisionDispatcher(collisionConfiguration);
+    var overlappingPairCache = new Ammo.btDbvtBroadphase();
+    var solver = new Ammo.btSequentialImpulseConstraintSolver();
+    var dynamicsWorld = new Ammo.btDiscreteDynamicsWorld(dispatcher, overlappingPairCache, solver, collisionConfiguration);
+    dynamicsWorld.setGravity(new Ammo.btVector3(0, -10, 0));
+
+    // ground
+    var groundTransform = new Ammo.btTransform();
+    groundTransform.setIdentity();
+    groundTransform.setOrigin(new Ammo.btVector3(groundPos[0], groundPos[1]-2, groundPos[2]));
+    var groundShape = new Ammo.btBoxShape(new Ammo.btVector3(50, 2, 50));
+    var localInertia = new Ammo.btVector3(0, 0, 0);
+    groundShape.calculateLocalInertia(0, localInertia);
+    var myMotionState = new Ammo.btDefaultMotionState(groundTransform);
+    var rbInfo = new Ammo.btRigidBodyConstructionInfo(0, myMotionState, groundShape, localInertia);
+    var body = new Ammo.btRigidBody(rbInfo);
+    dynamicsWorld.addRigidBody(body);
+    //bodies.push(body);
+
+    function parseVectorArray(verts,parse){
+        var verts = verts.split(' ');
+        for(var i=0; i<verts.length; i++){
+            verts[i] = verts[i].replace(/[\(\)]/g,'').split(',');
+            for(var j=0; j<verts[i].length; j++)
+                verts[i][j] = parse(verts[i][j]);
+        }
+        return verts;
+    }
+
+    function buildTriangles(verts, indices, normals) {
+        var attrs = [MeshData.POSITION];
+        if(normals)
+            attrs.push(MeshData.NORMAL);
+        var meshData = new MeshData(MeshData.defaultMap(attrs), verts.length / 3, indices.length);
+        meshData.getAttributeBuffer(MeshData.POSITION).set(verts);
+        if(normals)
+            meshData.getAttributeBuffer(MeshData.NORMAL).set(normals);
+        meshData.getIndexBuffer().set(indices);
+        meshData.indexModes = ['Triangles'];
+        return meshData;
+    }
+
+    function approxCenterOfMass(vol){
+        var position = vol.position;
+        var verts = vol.vertices;
+
+        // Get AABB
+        var xmin=verts[0][0],xmax=verts[0][0];
+        var ymin=verts[0][1],ymax=verts[0][1];
+        var zmin=verts[0][2],zmax=verts[0][2];
+        for(var j=0; j<verts.length; j++){
+            var v = verts[j];
+            if(v[0]>xmax) xmax = v[0];
+            if(v[1]>ymax) ymax = v[1];
+            if(v[2]>zmax) zmax = v[2];
+            if(v[0]<xmin) xmin = v[0];
+            if(v[1]<ymin) ymin = v[1];
+            if(v[2]<zmin) zmin = v[2];
+        }
+
+        var pieceVolume = (xmax-xmin)/2 * (ymax-ymin)/2 * (zmax-zmin)/2;
+
+        // Vector from center of volume to world center of AABB
+        var diffx = ( (xmax+xmin) / 2 );
+        var diffy = ( (ymax+ymin) / 2 );
+        var diffz = ( (zmax+zmin) / 2 );
+
+        // Move all vertices
+        for(var j=0; j<verts.length; j++){
+            var v = verts[j];
+            v[0] -= diffx;
+            v[1] -= diffy;
+            v[2] -= diffz;
+        }
+
+        // Move position to center of AABB
+        position.x += diffx;
+        position.y += diffy;
+        position.z += diffz;
+
+        vol.position = position;
+    }
+
+    function createVolume(def) {
+        def.vertices = parseVectorArray(def.vertices,parseFloat);
+        var verts = def.vertices;
+
+        approxCenterOfMass(def);
+
+        // Parse the vertices
+        var faceNormals = parseVectorArray(def.normals,parseFloat);
+        var faces = parseVectorArray(def.faces,parseInt);
+        var triangleIndices = [];
+        var vertices = [];
+        var normals = [];
+        var scale = 1;
+        var vertices2 = []; // without sharing vertices
+        var normals2 = []; // without sharing vertices
+        var triangleIndices2 = []; // without sharing vertices
+        for(var i=0; i<verts.length; i++){
+            vertices.push(  verts[i][0]*scale,
+                            verts[i][1]*scale,
+                            verts[i][2]*scale);
+            normals.push(0,1,0);
+        }
+
+        // Create triangles from faces
+        for(var i=0; i<faces.length; i++){
+            var face = faces[i];
+            for(var j=1; j<face.length-1; j++){
+                triangleIndices.push(
+                    face[0],
+                    face[j+1],
+                    face[j]
+                );
+            }
+
+            // Set normals to all triangles
+            for(var j=0; j<face.length; j++){
+                normals[face[j]*3+0] = faceNormals[i][0];
+                normals[face[j]*3+1] = faceNormals[i][1];
+                normals[face[j]*3+2] = faceNormals[i][2];
+            }
+
+            // Without sharing
+            for(var j=0; j<face.length; j++){
+                vertices2.push( vertices[face[j]*3+0],
+                                vertices[face[j]*3+1],
+                                vertices[face[j]*3+2] );
+                //triangleIndices2.push(j);
+                normals2.push(  faceNormals[i][0],
+                                faceNormals[i][1],
+                                faceNormals[i][2]);
+                if(j>0 && j<face.length-1){
+                    triangleIndices2.push(
+                        3*i+0,
+                        3*i+j+1,
+                        3*i+j
+                    );
+                }
+            }
+        }
+
+        //console.log(normals,normals.length,vertices.length)
+
+        var meshData1 = buildTriangles(vertices,triangleIndices,normals);
+        var flatMeshData = meshData1.buildFlatMeshData();
+        var normalsMesh = meshData1.getNormalsMeshData();
+        var wireframeMesh = meshData1.buildWireframeData();
+        var material1 = new Material(ShaderLib.uber);
+        var wireframeMaterial = new Material(ShaderLib.uber);
+        var normalMaterial = new Material(ShaderLib.uber);
+        wireframeMaterial.uniforms.materialDiffuse = [1, 1, 1, 1];
+        normalMaterial.uniforms.materialDiffuse = [0, 0, 0, 1];
+        material1.uniforms.materialDiffuse = [1, 0, 0, 0.1];
+
+        var position = [def.position.x,def.position.y,def.position.z];
+
+        var shape = new Ammo.btConvexHullShape();
+        for (var i = 0; i < vertices.length; i++ ) {
+            var point = vertices[i];
+            var v = new Ammo.btVector3(vertices[3*i],vertices[3*i+1],vertices[3*i+2]);
+            shape.addPoint(v);
+        }
+
+        var startTransform = new Ammo.btTransform();
+        startTransform.setIdentity();
+        var mass = def.volume*density;
+        var localInertia = new Ammo.btVector3(0, 0, 0);
+        shape.calculateLocalInertia(mass,localInertia);
+        startTransform.setOrigin(new Ammo.btVector3(position[0], position[1], position[2]));
+        var myMotionState = new Ammo.btDefaultMotionState(startTransform);
+        var rbInfo = new Ammo.btRigidBodyConstructionInfo(mass, myMotionState, shape, localInertia);
+        var body = new Ammo.btRigidBody(rbInfo);
+        dynamicsWorld.addRigidBody(body);
+        bodies.push(body);
+
+        //var normalsEntity = world.createEntity(normalsMesh,normalMaterial).addToWorld();
+        var entity = world.createEntity(flatMeshData, material1, position).addToWorld();
+        //entity.attachChild(normalsEntity);
+        entity.meshRendererComponent.castShadows = true;
+        return entity;
+    }
+
+    // Create ground plane
+    var meshData = ShapeCreator.createQuad(200,200);
+    var material = new Material(ShaderLib.uber);
+    material.uniforms.materialDiffuse = [0.7, 0.7, 0.7, 1];
+    var groundEntity = world.createEntity(meshData, material, groundPos).addToWorld();
+    groundEntity.transformComponent.setRotation(-Math.PI/2,0,0);
+    //meshes.push(groundEntity);
+    groundEntity.meshRendererComponent.receiveShadows = true;
+
+    var pointLight = new SpotLight();
+    pointLight.shadowSettings.shadowType = 'PCF';
+    //pointLight.range = 200;
+    pointLight.shadowCaster = true;
+
+    var light1 = world.createEntity(pointLight, [ 10,  20,  20]).addToWorld();
+    light1.lookAt(0,0,0);
+
+    var camera = new Camera(45, 1, 0.1, 1000);
+    var orbitCam = new OrbitCamControlScript({
+        spherical : new Vector3(15, Math.PI/3, Math.PI/9),
+    });
+    world.createEntity( camera, orbitCam).addToWorld();
+
+    // Create voronoi volumes
+    var vols = window.volumes;
+    for(var i=0; i<vols.length; i++){
+        var volumeEntity = createVolume(vols[i]);
+        meshes.push(volumeEntity);
+    }
+
+    var paused = true;
+    var trans = new Ammo.btTransform();
+    var gooQuaternion = new Quaternion();
+    goo.callbacks.push(function(tpf){
+        if(!paused)
+            dynamicsWorld.stepSimulation(tpf, 2, 1/60);
+
+        // Sync entity positions
+        for(var i=0; i<bodies.length; i++){
+            var body = bodies[i];
+            var trans = body.getCenterOfMassTransform();
+            var ammoQuat = trans.getRotation();
+            var origin = trans.getOrigin();
+            gooQuaternion.setd(ammoQuat.x(), ammoQuat.y(), ammoQuat.z(), ammoQuat.w());
+            meshes[i].transformComponent.transform.rotation.copyQuaternion(gooQuaternion);
+            meshes[i].transformComponent.setTranslation(origin.x(),origin.y(),origin.z());
+        }
+    });
+
+    setTimeout(function(){
+        paused = false;
+
+        setInterval(function(){
+
+            // Set initial positions
+            for(var i=0; i<bodies.length; i++){
+                var body = bodies[i];
+                trans.setIdentity();
+                var p = volumes[i].position;
+                trans.setOrigin(new Ammo.btVector3(p.x, p.y, p.z));
+                body.setCenterOfMassTransform(trans);
+
+                // Update mesh positions
+                var ammoQuat = trans.getRotation();
+                var origin = trans.getOrigin();
+                gooQuaternion.setd(ammoQuat.x(), ammoQuat.y(), ammoQuat.z(), ammoQuat.w());
+                meshes[i].transformComponent.transform.rotation.copyQuaternion(gooQuaternion);
+                meshes[i].transformComponent.setTranslation(origin.x(),origin.y(),origin.z());
+            }
+
+            paused = true;
+            setTimeout(function(){
+                paused = false;
+            },1000);
+
+        },5000);
+
+    },2000);
+
+});
+
+</script>
+</body>
+</html>
