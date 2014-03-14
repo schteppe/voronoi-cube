@@ -237,11 +237,12 @@ require([
     pointLight.shadowCaster = true;
 
     var light1 = world.createEntity(pointLight, [ 10,  20,  20]).addToWorld();
-    light1.lookAt(0,0,0);
+    light1.lookAt(2,0,5);
 
     var camera = new Camera(45, 1, 0.1, 1000);
     var orbitCam = new OrbitCamControlScript({
         spherical : new Vector3(15, Math.PI/3, Math.PI/9),
+        lookAtPoint : groundPos
     });
     world.createEntity( camera, orbitCam).addToWorld();
 
