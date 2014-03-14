@@ -6,23 +6,24 @@ var template = '{"id":%i,"position":{"x":%x,"y":%y,"z":%z},"vertices":"%p","face
 
 // Generate particle data
 var data = '';
-if(false){
-	data = '1 0 0 0';
-} else {
-	var N = 70;
-	for(var i=0; i<N; i++){
-		data += [i,Math.random(),Math.random(),Math.random()].join(' ')+'\n';
-	}
+var N = 70;
+for(var i=0; i<N; i++){
+	data += [i,Math.random(),Math.random(),Math.random()].join(' ')+'\n';
 }
 fs.writeFileSync(path.join(__dirname,'particles.txt'),data);
 
+// Run voro++
 var cmd = "voro++ -c '"+template+"' -1 1 -1 1 -1 1 particles.txt";
-
 exec(cmd,function(err,stdout,stderr){
-	if(err){
+	if(err)
 		throw err;
-	}
+
 	var data = fs.readFileSync(path.join(__dirname,'particles.txt.vol'));
 	fs.writeFileSync(path.join(__dirname,'volumes.js'),'volumes=['+data+']');
-	console.log("Done.")
+
+	// Remove temp files
+	fs.unlinkSync(path.join(__dirname,'particles.txt'));
+	fs.unlinkSync(path.join(__dirname,'particles.txt.vol'));
+
+	console.log("Created volumes.js")
 });
